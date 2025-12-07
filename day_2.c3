@@ -4,18 +4,14 @@ import std::core::string;
 import std::thread;
 import std::collections::map;
 import std::collections::list;
+import std::collections::ringbuffer;
 import libc;
 import std::time;
 
 const INPUT_PATH = "day_2_input.txt";
-const THREAD_NUM = 1;
+const THREAD_NUM = 4;
 
 alias Cond = ConditionVariable;
-
-struct QueueNode {
-	ulong      value;
-	QueueNode* next;
-}
 
 alias Stats = HashMap{String, List{Duration}};
 
@@ -25,6 +21,13 @@ struct StatsNode {
 	StatsNode* next;
 }
 
+struct Range {
+	ulong start;
+	ulong end;
+}
+
+alias Ranges = RingBuffer{Range[1024]};
+
 struct Payload {
 	struct result {
 		ulong value;
@@ -32,7 +35,8 @@ struct Payload {
 	}
 	struct queue {
 		usz        ready_count;
-		QueueNode* head;
+		bool       should_quit;
+		Ranges     ranges;
 		Mutex      mutex;
 		Cond       cond;
 	}
@@ -40,7 +44,6 @@ struct Payload {
 		StatsNode* head;
 		Mutex      mutex;
 	}
-	bool should_quit;
 }
 
 fn void add_stat(Stats* stats, String title, Time since)
@@ -61,31 +64,25 @@ fn int thread_fn(void* arg)
 	Payload* p = arg;
 
 	StatsNode* sn = malloc(StatsNode.sizeof);
-	sn.stats.init(mem);
+	sn.stats.init(mem, 1024 * 1024);
 
-	add_stat(&sn.stats, "stats_init", thread_start);
+	add_stat(&sn.stats, "stats init", thread_start);
 
 	bool is_startup = true;
-
-	while OUTER: (true) {
-		QueueNode* n;
-
-		Time queue_mutex_lock = time::now();
-
+	while (true) {
 		if (catch err = p.queue.mutex.lock()) {
 			io::printfn("thread queue mutex lock: %s", err);
 		}
-
-		add_stat(&sn.stats, "thread_queue_lock", queue_mutex_lock);
-
-		Time wait_start = time::now();
+		defer {
+			if (catch err = p.queue.mutex.unlock()) {
+				io::printfn("thread queue mutex unlock: %s", err);
+			}
+		}
 
 		if (is_startup) {
-			Time thread_startup = time::now();
-
 			sn.id = p.queue.ready_count;
 			p.queue.ready_count += 1;
-			io::printfn("[worker %d] new ready count = %d, signaled queue cond!", sn.id, p.queue.ready_count);
+			io::printfn("[worker %d] ready count set to %d, broadcasting queue cond", sn.id, p.queue.ready_count);
 
 			if (catch err = p.queue.cond.broadcast()) {
 				io::printfn("thread queue cond broadcast: %s", err);
@@ -93,122 +90,99 @@ fn int thread_fn(void* arg)
 
 			is_startup = false;
 
-			add_stat(&sn.stats, "thread_startup", thread_startup);
+			add_stat(&sn.stats, "thread startup", thread_start);
 		}
 
-		if (!p.should_quit) {
-			Time before_should_quit = time::now();
-
-			if (is_startup) {
-				io::printfn("[worker %d] queue cond broadcasting", sn.id);
-				if (catch err = p.queue.cond.broadcast()) {
-					io::printfn("thread queue cond broadcast: %s", err);
-				}
-			}
-
-			Time cond_wait_start = time::now();
-
-			if (catch err = p.queue.cond.wait(&p.queue.mutex)) {
-				io::printfn("thread queue cond wait: %s", err);
-			}
-
-			add_stat(&sn.stats, "thread_queue_cond_wait", cond_wait_start);
-
-			add_stat(&sn.stats, "thread_queue_wait_before_should_quit", before_should_quit);
+		if (catch err = p.queue.cond.wait(&p.queue.mutex)) {
+			io::printfn("thread queue cond wait: %s", err);
 		}
 
-		if (p.queue.head == null && p.should_quit) {
-			if (catch err = p.queue.mutex.unlock()) {
-				io::printfn("thread queue mutex lock: %s", err);
-			}
+		add_stat(&sn.stats, "thread wait", thread_start);
 
-			io::printfn("[worker %d] p.queue.head is %d", sn.id, p.queue.head);
-			add_stat(&sn.stats, "total_thread_wait_time_for_job", queue_mutex_lock);
+		if (p.queue.ready_count < THREAD_NUM + 1) {
+			add_stat(&sn.stats, "thread woken - other threads not ready", thread_start);
 
+			continue;
+		} else {
 			break;
 		}
+	}
 
-		if (p.should_quit) {
-			add_stat(&sn.stats, "thread_wait_post_broadcast", wait_start);
+	while (p.queue.ranges.written > 0) {
+		if (catch err = p.queue.mutex.lock()) {
+			io::printfn("thread queue mutex lock: %s", err);
 		}
 
-		if (p.queue.head == null || p.queue.ready_count < THREAD_NUM + 1) {
-			if (catch err = p.queue.mutex.unlock()) {
-				io::printfn("thread queue mutex lock: %s", err);
-			}
-
-			add_stat(&sn.stats, "thread_release_no_job", queue_mutex_lock);
-			add_stat(&sn.stats, "total_thread_wait_time_for_job", queue_mutex_lock);
-			continue;
-		};
-
-		n = p.queue.head;
-		p.queue.head = p.queue.head.next;
+		Range? range = p.queue.ranges.pop();
+		if (catch err = range) {
+			io::printfn("queue ranges pop: %s", err);
+			return 1;
+		}
+		io::printfn("%d %d", range.start, range.end);
 
 		if (catch err = p.queue.mutex.unlock()) {
 			io::printfn("thread queue mutex unlock: %s", err);
 		}
 
-		add_stat(&sn.stats, "total_thread_wait_time_for_job", queue_mutex_lock);
+		ulong x = range.start;
+		while RANGE: (x <= range.end) {
+			defer ++x;
+			Time begin_job = time::now();
 
-		Time begin_job = time::now();
+			char[1024] buf;
+			String num_str = string::bformat(&buf, "%d", x);
 
-		char[1024] buf;
-		String num_str = string::bformat(&buf, "%d", n.value);
+			// add_stat(&sn.stats, "string_from_number", begin_job);
 
-		add_stat(&sn.stats, "string_from_number", begin_job);
+			for (uint div = 2; div <= num_str.len; ++div) {
+				if (num_str.len % div != 0) continue;
 
-		for (uint div = 2; div <= num_str.len; ++div) {
-			if (num_str.len % div != 0) continue;
+				bool found = true;
+				uint current_pos = 0;
+				uint sub_num_len = num_str.len / div;
+				while COMPARE: (current_pos < sub_num_len) {
+					uint current_repetition = 1;
+					while (current_repetition < div) {
+						if (num_str[current_pos] !=
+						    num_str[current_repetition * sub_num_len + current_pos]) {
+							found = false;
 
-			bool found = true;
-			uint current_pos = 0;
-			uint sub_num_len = num_str.len / div;
-			while COMPARE: (current_pos < sub_num_len) {
-				uint current_repetition = 1;
-				while (current_repetition < div) {
-					if (num_str[current_pos] !=
-					    num_str[current_repetition * sub_num_len + current_pos]) {
-						found = false;
+							break COMPARE;
+						}
 
-						break COMPARE;
+						current_repetition += 1;
 					}
 
-					current_repetition += 1;
+					current_pos += 1;
 				}
 
-				current_pos += 1;
+				if (found) {
+					// io::printfn("[worker %d] found value %d %s", sn.id, x, num_str);
+					if (catch err = p.result.mutex.lock()) {
+						io::printfn("thread result mutex lock: %s", err);
+					}
+
+					p.result.value += x;
+
+					if (catch err = p.result.mutex.unlock()) {
+						io::printfn("thread result mutex unlock: %s", err);
+					}
+
+					add_stat(&sn.stats, "processing_time (found)", begin_job);
+
+					continue RANGE;
+				}
 			}
-
-			if (found) {
-				// io::printfn("[worker %d] found value %d %s", sn.id, n.value, num_str);
-				if (catch err = p.result.mutex.lock()) {
-					io::printfn("thread result mutex lock: %s", err);
-				}
-
-				p.result.value += n.value;
-
-				if (catch err = p.result.mutex.unlock()) {
-					io::printfn("thread result mutex unlock: %s", err);
-				}
-
-				add_stat(&sn.stats, "processing_time (found)", begin_job);
-
-				continue OUTER;
-			}
-		}
 
 		add_stat(&sn.stats, "processing_time (not found)", begin_job);
+		}
 	}
-
-	Time last_lock_start = time::now();
 
 	if (catch err = p.stats.mutex.lock()) {
 		io::printfn("thread stats mutex lock: %s", err);
 	}
 
 	add_stat(&sn.stats, "total_thread_time", thread_start);
-	add_stat(&sn.stats, "last_lock", last_lock_start);
 
 	sn.next = p.stats.head;
 	p.stats.head = sn;
@@ -218,7 +192,6 @@ fn int thread_fn(void* arg)
 	}
 
 	io::printfn("[worker %d] returning", sn.id);
-
 	return 0;
 }
 
@@ -321,6 +294,26 @@ fn int main()
 
 	add_stat(&ps, "create_threads", thread_create_start);
 
+	Time queue_create_start = time::now();
+
+	if (catch err = p.queue.mutex.lock()) {
+		io::printfn("main lock: %s", err);
+	}
+
+	foreach (range : ranges) {
+		String[] pair = range.tsplit("-");
+		ulong start = pair[0].to_ulong()!!;
+		ulong end   = pair[1].to_ulong()!!;
+
+		p.queue.ranges.push({ start = start, end = end });
+	}
+
+	if (catch err = p.queue.mutex.unlock()) {
+		io::printfn("main unlock: %s", err);
+	}
+
+	add_stat(&ps, "queue_create", queue_create_start);
+
 	bool is_startup = true;
 
 	Time wait_for_threads_start = time::now();
@@ -365,38 +358,13 @@ fn int main()
 
 	io::printfn("[producer] TIME TO DO WORK");
 
-	Time queue_create_start = time::now();
-
-	foreach (range : ranges) {
-		String[] pair = range.tsplit("-");
-		ulong start = pair[0].to_ulong()!!;
-		ulong end   = pair[1].to_ulong()!!;
-
-		for (ulong x = start; x <= end; ++x) {
-			if (catch err = p.queue.mutex.lock()) {
-				io::printfn("main lock: %s", err);
-			}
-
-				QueueNode* new_head = tmalloc(QueueNode.sizeof);
-				new_head.value = x;
-				new_head.next = p.queue.head;
-				p.queue.head = new_head;
-
-			if (catch err = p.queue.mutex.unlock()) {
-				io::printfn("main unlock: %s", err);
-			}
-		}
-	}
-
-	add_stat(&ps, "queue_create", queue_create_start);
-
 	Time queue_broadcast_start = time::now();
 
 	if (catch err = p.queue.mutex.lock()) {
 		io::printfn("main lock 2: %s", err);
 	}
 
-		p.should_quit = true;
+		p.queue.should_quit = true;
 
 		io::printfn("processing batch ready!");
 		if (catch err = p.queue.cond.broadcast()) {
