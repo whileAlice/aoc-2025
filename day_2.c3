@@ -1,3 +1,6 @@
+/* I think this could be definitely improved, both with respect
+   to the algorithm itself, and to better distribution of work
+   over multiple cores. */
 import std::collections::map;
 import std::collections::list;
 import std::collections::ringbuffer;
@@ -14,7 +17,7 @@ const INPUT_PATH       = "day_2_input.txt";
 const THREAD_COUNT     = 4;
 const ENABLE_PROFILING = true;
 
-fn int second_task_thread(void* arg)
+fn int first_task_thread(void* arg)
 {
 	Time thread_start = time::now();
 
@@ -23,30 +26,31 @@ fn int second_task_thread(void* arg)
 	StatsNode* sn = malloc(StatsNode.sizeof);
 	sn.stats.init(mem);
 
-	add_stat(&sn.stats, "stats init", thread_start);
+	add_stat(&sn.stats, "[t1] stats init", thread_start);
 
 	@in_lock(p.queue)
 	{
 		sn.id = p.queue.ready_count;
 		p.queue.ready_count += 1;
-		io::printfn("[worker %d] ready count set to %d, broadcasting queue cond",
+		io::printfn("[worker %d] [t1] ready count set to %d, broadcasting queue cond",
 					sn.id, p.queue.ready_count);
 
 		@broadcast(p.queue);
 
-		add_stat(&sn.stats, "thread startup", thread_start);
+		add_stat(&sn.stats, "[t1] thread startup", thread_start);
 
 		while (p.queue.ready_count < THREAD_COUNT + 1) {
-			io::printfn("[worker %d] waiting...", sn.id);
+			io::printfn("[worker %d] [t1] waiting...", sn.id);
 
 			@wait(p.queue);
 
-			io::printfn("[worker %d] woken up", sn.id);
+			io::printfn("[worker %d] [t1] woken up", sn.id);
 		}
 
-		add_stat(&sn.stats, "thread wait", thread_start);
+		add_stat(&sn.stats, "[t1] thread wait", thread_start);
 	};
 
+	char[1024] buf;
 	while (true) {
 		Range? range;
 
@@ -57,14 +61,95 @@ fn int second_task_thread(void* arg)
 		};
 
 		if (catch err = range) {
-			io::printfn("thread queue ranges pop: %s", err);
+			io::printfn("[t1] thread queue ranges pop: %s", err);
+			os::exit(1);
+		}
+
+		for (ulong x = range.start; x <= range.end; ++x) {
+			String num_str = string::bformat(&buf, "%d", x);
+			libc::DivResult div_result = libc::div(num_str.len, 2);
+
+			bool is_odd   = div_result.rem != 0;
+			uint midpoint = div_result.quot;
+
+			if (is_odd) continue;
+
+			String part1 = num_str[..midpoint - 1];
+			String part2 = num_str[midpoint..];
+
+			if ((part1.to_uint()!!) == (part2.to_uint()!!)) {
+				@in_lock(p.result)
+				{
+					p.result.value += x;
+				};
+			}
+		}
+	}
+
+	add_stat(&sn.stats, "[t1] total_thread_time", thread_start);
+
+	@in_lock(p.stats)
+	{
+		sn.next = p.stats.head;
+		p.stats.head = sn;
+	};
+
+	io::printfn("[worker %d] [t1] thread returning", sn.id);
+
+	return 0;
+}
+
+fn int second_task_thread(void* arg)
+{
+	Time thread_start = time::now();
+
+	Payload* p = arg;
+
+	StatsNode* sn = malloc(StatsNode.sizeof);
+	sn.stats.init(mem);
+
+	add_stat(&sn.stats, "[t2] stats init", thread_start);
+
+	@in_lock(p.queue)
+	{
+		sn.id = p.queue.ready_count;
+		p.queue.ready_count += 1;
+		io::printfn("[worker %d] [t2] ready count set to %d, broadcasting queue cond",
+					sn.id, p.queue.ready_count);
+
+		@broadcast(p.queue);
+
+		add_stat(&sn.stats, "[t2] thread startup", thread_start);
+
+		while (p.queue.ready_count < THREAD_COUNT + 1) {
+			io::printfn("[worker %d] [t2] waiting...", sn.id);
+
+			@wait(p.queue);
+
+			io::printfn("[worker %d] [t2] woken up", sn.id);
+		}
+
+		add_stat(&sn.stats, "[t2] thread wait", thread_start);
+	};
+
+	char[1024] buf;
+	while (true) {
+		Range? range;
+
+		@in_lock(p.queue)
+		{
+			if (p.queue.ranges.written == 0) break;
+			range = p.queue.ranges.pop();
+		};
+
+		if (catch err = range) {
+			io::printfn("[t2] thread queue ranges pop: %s", err);
 			os::exit(1);
 		}
 
 		// TODO: I think this could be optimized by noticing that subsequent numbers
 		// don't differ much from previous ones, that only a difference of x digits
 		// could possibly change the result compared to the previous number.
-		char[1024] buf;
 		ulong x = range.start;
 		while RANGE: (x <= range.end) {
 			defer ++x;
@@ -101,16 +186,16 @@ fn int second_task_thread(void* arg)
 					p.result.value += x;
 				};
 
-				add_stat(&sn.stats, "processing_time (found)", processing_start);
+				add_stat(&sn.stats, "[t2] processing_time (found)", processing_start);
 
 				continue RANGE;
 			}
 
-		add_stat(&sn.stats, "processing_time (not found)", processing_start);
+		add_stat(&sn.stats, "[t2] processing_time (not found)", processing_start);
 		}
 	}
 
-	add_stat(&sn.stats, "total_thread_time", thread_start);
+	add_stat(&sn.stats, "[t2] total_thread_time", thread_start);
 
 	@in_lock(p.stats)
 	{
@@ -118,174 +203,207 @@ fn int second_task_thread(void* arg)
 		p.stats.head = sn;
 	};
 
-	io::printfn("[worker %d] thread returning", sn.id);
+	io::printfn("[worker %d] [t2] thread returning", sn.id);
 
 	return 0;
 }
 
 fn int main()
 {
-	Stats ps;
-	ps.init(mem);
+	Stats manager_stats;
+	manager_stats.init(mem);
 
 	Time main_start = time::now();
 
-	String? input = ((String)file::load_temp(INPUT_PATH)).trim_right();
-	if (catch err = input) {
+	String? raw_input = ((String)file::load_temp(INPUT_PATH));
+	if (catch err = raw_input) {
 		io::printfn("failed to open %s: %s", INPUT_PATH, err);
 
 		os::exit(1);
 	}
+	String[] raw_ranges = raw_input.trim_right().tsplit(",");
 
-	add_stat(&ps, "process_file", main_start);
+	Ranges ranges;
+	ranges.init();
 
-	Time task_1_start = time::now();
+	foreach (raw_range : raw_ranges) {
+		String[] pair = raw_range.tsplit("-");
+		ulong start   = pair[0].to_ulong()!!;
+		ulong end     = pair[1].to_ulong()!!;
 
-	ulong result = 0;
+		ranges.push({ start = start, end = end });
+	}
 
-	String[] ranges = input.tsplit(",");
-	if (0) {
-	foreach (range : ranges) {
-		String[] pair = range.tsplit("-");
-		ulong start = pair[0].to_ulong()!!;
-		ulong end   = pair[1].to_ulong()!!;
+	add_stat(&manager_stats, "process_file", main_start);
 
-		for (ulong x = start; x <= end; ++x) {
-			String num_str = string::tformat("%d", x);
-			libc::DivResult div_result = libc::div(num_str.len, 2);
+	Time payload_1_init_start = time::now();
 
-			bool is_odd   = div_result.rem != 0;
-			uint midpoint = div_result.quot;
+	Payload* payload_1 = tmalloc(Payload.sizeof);
+	@cond_init(payload_1.queue);
+	defer @cond_destroy(payload_1.queue);
+	@mutex_init(payload_1.queue);
+	defer @mutex_destroy(payload_1.queue);
+	@mutex_init(payload_1.result);
+	defer @mutex_destroy(payload_1.result);
+	@mutex_init(payload_1.stats);
+	defer @mutex_destroy(payload_1.stats);
 
-			if (is_odd) continue;
+	payload_1.queue.ranges = ranges;
 
-			String part1 = num_str[..midpoint - 1];
-			String part2 = num_str[midpoint..];
+	add_stat(&manager_stats, "payload_1_init", payload_1_init_start);
 
-			if ((part1.to_uint()!!) == (part2.to_uint()!!)) {
-				result += x;
-			}
+	Time task_1_thread_create_start = time::now();
+
+	Thread[THREAD_COUNT] task_1_threads;
+	foreach (i, &thread : task_1_threads) {
+		if (catch err = thread.create(&first_task_thread, payload_1)) {
+			io::printfn("task 1 thread %d create: %s", i, err);
 		}
 	}
+
+	add_stat(&manager_stats, "create_task_1_threads", task_1_thread_create_start);
+
+	Time wait_for_task_1_threads_start = time::now();
+
+	@in_lock(payload_1.queue)
+	{
+		payload_1.queue.ready_count += 1;
+		io::printfn("[manager] ready count set to %d", payload_1.queue.ready_count);
+
+		@broadcast(payload_1.queue);
+		io::printn("[manager] waking up threads");
+
+		while (payload_1.queue.ready_count < THREAD_COUNT + 1) {
+			io::printn("[manager] waiting for threads...");
+
+			@wait(payload_1.queue);
+
+			io::printn("[manager] woken up!");
+		}
+	};
+
+	add_stat(&manager_stats, "waiting_for_task_1_threads",
+			 wait_for_task_1_threads_start);
+
+	io::printn("[manager] begin task 1");
+
+	Time task_1_thread_join_start = time::now();
+
+	foreach (i, &thread : task_1_threads) {
+		io::printfn("task 1 joining thread %d", i);
+		if (catch err = thread.join()) {
+			io::printfn("task 1 thread %d join: %s", i, err);
+		}
 	}
 
-	io::printfn("result [1]: %d", result);
+	add_stat(&manager_stats, "task_1_thread_join", task_1_thread_join_start);
 
-	add_stat(&ps, "task_1", task_1_start);
+	io::printn("===============================================================");
+	io::printfn("[result 1]: %d", payload_1.result.value);
+	io::printn("===============================================================");
 
-	Time payload_init_start = time::now();
+	Time payload_2_init_start = time::now();
 
-	Payload* p = tmalloc(Payload.sizeof);
-	@cond_init(p.queue);
-	defer @cond_destroy(p.queue);
-	@mutex_init(p.queue);
-	defer @mutex_destroy(p.queue);
-	@mutex_init(p.result);
-	defer @mutex_destroy(p.result);
-	@mutex_init(p.stats);
-	defer @mutex_destroy(p.stats);
+	Payload* payload_2 = tmalloc(Payload.sizeof);
+	@cond_init(payload_2.queue);
+	defer @cond_destroy(payload_2.queue);
+	@mutex_init(payload_2.queue);
+	defer @mutex_destroy(payload_2.queue);
+	@mutex_init(payload_2.result);
+	defer @mutex_destroy(payload_2.result);
+	@mutex_init(payload_2.stats);
+	defer @mutex_destroy(payload_2.stats);
 
-	add_stat(&ps, "payload_init", payload_init_start);
+	payload_2.queue.ranges = ranges;
 
-	Time thread_create_start = time::now();
+	add_stat(&manager_stats, "payload_2_init", payload_2_init_start);
 
-	Thread[THREAD_COUNT] threads;
-	foreach (i, &thread : threads) {
-		if (catch err = thread.create(&second_task_thread, p)) {
+	Time task_2_thread_create_start = time::now();
+
+	Thread[THREAD_COUNT] task_2_threads;
+	foreach (i, &thread : task_2_threads) {
+		if (catch err = thread.create(&second_task_thread, payload_2)) {
 			io::printfn("thread %d create: %s", i, err);
 		}
 	}
 
-	add_stat(&ps, "create_threads", thread_create_start);
+	add_stat(&manager_stats, "create_task_2_threads", task_2_thread_create_start);
 
-	Time queue_create_start = time::now();
+	Time wait_for_task_2_threads_start = time::now();
 
-	@in_lock(p.queue)
+	@in_lock(payload_2.queue)
 	{
-		foreach (range : ranges) {
-			String[] pair = range.tsplit("-");
-			ulong start = pair[0].to_ulong()!!;
-			ulong end   = pair[1].to_ulong()!!;
+		payload_2.queue.ready_count += 1;
+		io::printfn("[manager] ready count set to %d", payload_2.queue.ready_count);
 
-			p.queue.ranges.push({ start = start, end = end });
+		@broadcast(payload_2.queue);
+		io::printn("[manager] waking up threads");
+
+		while (payload_2.queue.ready_count < THREAD_COUNT + 1) {
+			io::printn("[manager] waiting for threads...");
+
+			@wait(payload_2.queue);
+
+			io::printn("[manager] woken up!");
 		}
-
-		io::printfn("[producer] queue is ready");
-		add_stat(&ps, "queue_create", queue_create_start);
-
-		p.queue.ready_count += 1;
-		io::printfn("[producer] ready count set to %d", p.queue.ready_count);
-
-		@broadcast(p.queue);
-		io::printfn("[producer] waking up threads");
-
-		Time wait_for_threads_start = time::now();
-
-		while (p.queue.ready_count < THREAD_COUNT + 1) {
-			io::printfn("[producer] waiting for threads...");
-
-			@wait(p.queue);
-
-			io::printfn("[producer] woken up!");
-		}
-
-		add_stat(&ps, "waiting_for_threads", wait_for_threads_start);
 	};
 
-	io::printfn("[producer] TIME TO DO WORK");
+	add_stat(&manager_stats, "waiting_for_task_2_threads",
+			 wait_for_task_2_threads_start);
 
-	Time thread_join_start = time::now();
+	io::printn("[manager] begin task 2");
 
-	foreach (i, &thread : threads) {
+	Time task_2_thread_join_start = time::now();
+
+	foreach (i, &thread : task_2_threads) {
 		io::printfn("joining thread %d", i);
 		if (catch err = thread.join()) {
 			io::printfn("thread %d join: %s", i, err);
 		}
 	}
 
-	add_stat(&ps, "thread_join", thread_join_start);
+	add_stat(&manager_stats, "task_2_thread_join", task_2_thread_join_start);
 
-	io::printfn("result [2]: %d", p.result.value);
 
-	add_stat(&ps, "total_main_time", main_start);
+	io::printn("===============================================================");
+	io::printfn("[result 2]: %d", payload_2.result.value);
+	io::printn("===============================================================");
+
+	add_stat(&manager_stats, "total_main_time", main_start);
 
 	if (!ENABLE_PROFILING) return 0;
 
-	io::printfn("==============================================================");
-	Duration total_processing_time;
-	Duration max_processing_time;
-	Duration string_from_number_time;
+	io::printn("===============================================================");
+	io::printn("                           NICE STATS                          ");
+	io::printn("===============================================================");
+	Duration total_task_2_processing_time;
+	Duration max_task_2_processing_time;
 
-	while (p.stats.head != null) {
-		p.stats.head.stats.@each(;String k, List{Duration} v) {
+	while (payload_2.stats.head != null) {
+		payload_2.stats.head.stats.@each(;String k, List{Duration} v) {
 			if (k.contains("processing")) {
-				total_processing_time += sum_durations(&v);
-				if (max_processing_time < sum_durations(&v)) {
-					max_processing_time = sum_durations(&v);
+				total_task_2_processing_time += sum_durations(&v);
+				if (max_task_2_processing_time < sum_durations(&v)) {
+					max_task_2_processing_time = sum_durations(&v);
 				}
 			}
 
-			if (k.contains("string")) {
-				string_from_number_time += sum_durations(&v);
-			}
-
-			io::printfn("[%d] %s: %s s", p.stats.head.id, k, sum_durations(&v).to_nano().to_sec());
+			io::printfn("[%d] %s: %s s", payload_2.stats.head.id,
+						k, sum_durations(&v).to_nano().to_sec());
 		};
 
-		p.stats.head = p.stats.head.next;
+		payload_2.stats.head = payload_2.stats.head.next;
 	}
-	io::printfn("==============================================================");
-	io::printfn("total processing time: %s s", total_processing_time.to_nano().to_sec());
-	io::printfn("max processing time: %s s", max_processing_time.to_nano().to_sec());
-	io::printfn("avg processing time: %s s", total_processing_time.to_nano().to_sec() / THREAD_COUNT);
-	io::printfn("avg string from number time: %s s", string_from_number_time.to_nano().to_sec() / THREAD_COUNT);
-	io::printfn("==============================================================");
+	io::printn("===============================================================");
+	io::printfn("total t2 processing time: %s s",
+				total_task_2_processing_time.to_nano().to_sec());
+	io::printfn("max t2 processing time: %s s",
+				max_task_2_processing_time.to_nano().to_sec());
+	io::printfn("avg t2 processing time: %s s",
+				total_task_2_processing_time.to_nano().to_sec() / THREAD_COUNT);
+	io::printn("===============================================================");
 
-	ps.@each(;String k, List{Duration} v) {
-		if (k.contains("processing")) {
-			total_processing_time += sum_durations(&v);
-		}
-
+	manager_stats.@each(;String k, List{Duration} v) {
 		io::printfn("[main] %s: %s s", k, sum_durations(&v).to_nano().to_sec());
 	};
 
